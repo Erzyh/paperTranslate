@@ -33,10 +33,12 @@
 
 ## 설치와 실행
 
-1. [Releases](https://github.com/Erzyh/paperTranslate/releases)에서 `paperTranslate-*-windows-x64.zip`을 받아 압축을 풉니다.
-2. 폴더 안의 `paperTranslate.exe`를 실행합니다.
+1. [Releases](https://github.com/Erzyh/paperTranslate/releases/latest)에서 `paperTranslate-Setup-*.exe`를 받아 실행합니다.
+2. 설치가 끝나면 시작 메뉴(원하면 바탕화면)의 paperTranslate로 실행합니다.
 
-처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 "추가 정보"를 누른 뒤 "실행"을 누르세요. 코드 서명을 하지 않은 앱이라 나오는 안내입니다.
+관리자 권한 없이 사용자 계정에만 설치됩니다 (`%LOCALAPPDATA%\Programs\paperTranslate`). 지울 때는 "설정 > 앱"에서 paperTranslate를 제거하면 되고, 이때 번역 기록과 설정도 지울지 묻습니다.
+
+설치 파일을 실행할 때 "Windows의 PC 보호" 창이 뜨면 "추가 정보"를 누른 뒤 "실행"을 누르세요. 코드 서명을 하지 않은 프로그램이라 나오는 안내입니다.
 화면은 Windows 10/11에 들어 있는 WebView2로 띄우므로 따로 설치할 것은 없습니다.
 앱 창을 닫으면 번역 서버도 같이 꺼지고, 번역 중인 논문이 있으면 닫기 전에 한 번 묻습니다.
 
@@ -65,11 +67,11 @@ Claude는 안전 분류기 때문에 일부 문단(예: 생물학 이중 용도 
 
 "이 버전 건너뛰기"를 누르면 그 버전은 다시 묻지 않고, 그다음 버전이 나오면 다시 알려 줍니다.
 
-업데이트하려면 앱 폴더에 쓰기 권한이 있어야 합니다. `Program Files`가 아니라 문서나 바탕화면 같은 사용자 폴더에 압축을 풀어 두세요.
+설치 파일 대신 zip을 받아 쓰는 경우에도 자동 업데이트가 됩니다. 이때는 `Program Files`가 아니라 문서나 바탕화면처럼 쓰기 권한이 있는 폴더에 압축을 풀어 두세요.
 
 ## 데이터 위치
 
-업로드한 PDF, 번역 결과, 기록은 `%LOCALAPPDATA%\paperTranslate`에 저장됩니다. 앱을 지워도 이 폴더는 남으니 필요 없으면 직접 지워 주세요.
+업로드한 PDF, 번역 결과, 기록은 `%LOCALAPPDATA%\paperTranslate`에 저장됩니다. 앱을 제거할 때 이 폴더도 지울지 묻고, zip으로 쓰다가 지운 경우에는 직접 지워 주세요.
 
 ## 환경변수 설정
 
@@ -112,7 +114,7 @@ backend\.venv\Scripts\python.exe desktop\launcher.py
 powershell -ExecutionPolicy Bypass -File desktop\build.ps1
 ```
 
-릴리즈용 zip과 체크섬 파일은 `desktop\package.ps1`로 만듭니다.
+릴리즈에 올릴 설치 파일, zip, 체크섬은 `desktop\package.ps1`로 만듭니다. 설치 파일을 만들려면 [Inno Setup 6](https://jrsoftware.org/isinfo.php)이 필요합니다 (`winget install JRSoftware.InnoSetup`).
 
 화면만 고칠 때는 백엔드를 `backend\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000`으로 띄우고(`PAPERTRANSLATE_TRANSLATOR`는 `ollama` 또는 `stub`), `frontend`에서 `npm run dev`를 실행한 뒤 http://localhost:5173 을 열면 됩니다.
 
