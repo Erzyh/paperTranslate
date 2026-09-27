@@ -1,0 +1,7 @@
+pymupdf
+fastapi
+uvicorn
+python-multipart
+httpx
+pytest
+anthropic

@@ -1,0 +1,25 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime data (uploads, outputs, DB, figure crops) — never commit user papers
+backend/data/
+
+# Node
+frontend/node_modules/
+
+# One-click launcher artifacts
+model.txt
+
+# Frontend build output (built by desktop/build.ps1 or npm run build)
+frontend/dist/
+
+# Desktop app build (PyInstaller)
+/build/
+/dist/
+build.log
+
+# Release packages (desktop/package.ps1)
+/release/
