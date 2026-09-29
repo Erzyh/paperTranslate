@@ -25,6 +25,8 @@
 ## 주요 기능
 
 - 원문 레이아웃을 유지한 번역 PDF
+- 레이아웃 인식 모델로 제목, 본문, 그림, 표, 수식, 머리말/꼬리말을 구분합니다. Nature나 Science처럼 표지와 인포그래픽이 화려한 레이아웃도 본문만 골라 번역합니다.
+- 글자 레이어가 없는 스캔 PDF는 OCR로 읽어서 번역합니다.
 - 원문과 번역을 나란히 보는 화면 (문단 연결, 그림과 표 미리보기, 인용 번호를 누르면 참고문헌 정보)
 - 선택한 문장이나 수식을 AI가 풀어서 설명
 - 여러 편을 한 번에 번역. 폴더를 넣으면 하위 폴더까지 PDF를 찾아서 순서대로 번역합니다.
@@ -98,6 +100,9 @@ cd backend
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -r ..\desktop\requirements.txt
 
+# 레이아웃 인식 / OCR 모델 받기 (backend\models, 약 90MB)
+.venv\Scripts\python.exe scripts\fetch_models.py
+
 # 화면 빌드
 cd ..\frontend
 npm ci
@@ -126,6 +131,7 @@ cd backend
 ```
 
 테스트는 가짜 번역기와 가짜 HTTP 응답으로만 돌아가고, Ollama, OpenAI, Gemini, Anthropic에 실제로 접속하지 않습니다.
+모델 파일이 없으면 모델이 필요한 테스트는 건너뛰고, 앱은 규칙 기반 분석만으로 동작합니다 (`PAPERTRANSLATE_LAYOUT_MODEL=0`으로 일부러 끌 수도 있습니다).
 
 ## 폴더 구조
 
@@ -141,3 +147,5 @@ cd backend
 
 PDF 처리에 AGPL-3.0 라이선스인 [PyMuPDF](https://github.com/pymupdf/PyMuPDF)를 쓰기 때문에 이 프로젝트와 배포하는 앱 전체가 AGPL-3.0을 따릅니다.
 누구나 쓰고 고칠 수 있지만, 고친 버전을 배포하거나 네트워크 서비스로 제공할 때는 그 소스 코드도 같은 라이선스로 공개해야 합니다.
+
+레이아웃 인식(PP-DocLayoutV2)과 OCR(PP-OCRv6) 모델은 PaddlePaddle의 Apache-2.0 모델을 [RapidAI](https://github.com/RapidAI)가 ONNX로 변환한 것입니다. `backend/scripts/fetch_models.py`가 받아서 레이아웃 모델을 int8로 줄입니다.

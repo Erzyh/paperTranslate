@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from app.pipeline.extract import _is_math_font, math_span_literal
+from app.pipeline.extract import (
+    _attach_drop_caps,
+    _is_math_font,
+    is_drop_cap_span,
+    is_masked_math_span,
+    math_span_literal,
+)
+from app.pipeline.models import Block, Line, Span
 
 MATH_FONT_AVAILABLE = Path(r"C:\Windows\Fonts\seguisym.ttf").exists()
 
@@ -83,3 +90,39 @@ def test_is_math_font_heuristic():
     assert not _is_math_font("ENXOBD+FormataOTF-Bold")
     # STIXGeneral is a body-text font in some journals: never a math marker.
     assert not _is_math_font("STIXGeneral-Regular")
+
+
+def test_text_family_named_math_is_not_math():
+    # Nature sets standfirsts in GlosaMath-Roman: a text face, not math.
+    assert not _is_math_font("GlosaMath-Roman")
+    assert not _is_math_font("ABCDEF+GlosaMath-RomanItalic")
+    assert _is_math_font("STIXMath-Italic")
+    assert _is_math_font("CambriaMath")
+    assert _is_math_font("LatinModernMath-Regular")
+
+
+def test_drop_cap_is_never_masked():
+    assert is_drop_cap_span("M", 54.0)
+    assert not is_drop_cap_span("M", 10.0)
+    assert not is_drop_cap_span("Mo", 54.0)
+    assert not is_masked_math_span("M", "CambriaMath", 54.0)
+    assert is_masked_math_span("x", "CambriaMath", 10.0)
+
+
+def test_drop_cap_joins_paragraph_start():
+    cap = Span("M", (34, 505, 60, 545), "Display", 54.0, 0)
+    first = Span("ore than 70%", (62, 507, 290, 517), "Body", 9.5, 0)
+    second = Span("of researchers", (62, 519, 290, 529), "Body", 9.5, 0)
+    blocks = [
+        Block("text", (34, 505, 60, 545), [Line([cap], (34, 505, 60, 545))]),
+        Block("text", (62, 507, 290, 529), [
+            Line([first], (62, 507, 290, 517)),
+            Line([second], (62, 519, 290, 529)),
+        ]),
+    ]
+    _attach_drop_caps(blocks)
+    assert len(blocks) == 1
+    line = blocks[0].lines[0]
+    assert "".join(sp.text for sp in line.spans) == "More than 70%"
+    assert line.spans[0].size == 9.5
+    assert line.bbox[0] == 34 and line.bbox[1] == 507

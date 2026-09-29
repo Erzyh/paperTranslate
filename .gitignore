@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Layout/OCR ONNX models (downloaded by backend/scripts/fetch_models.py)
+backend/models/
+
 # Runtime data (uploads, outputs, DB, figure crops) — never commit user papers
 backend/data/
 

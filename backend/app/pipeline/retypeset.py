@@ -11,6 +11,7 @@ import pymupdf
 from app import config
 
 from .extract import is_masked_math_span
+from .ocr import is_scanned_page
 from .models import RenderReport, Segment
 from .segment import UNTRANSLATED_KINDS
 
@@ -459,7 +460,8 @@ def _scan_math_spans(
             lbox = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
             for span in line.get("spans", []):
                 if not is_masked_math_span(
-                        span.get("text", ""), span.get("font", "")):
+                        span.get("text", ""), span.get("font", ""),
+                        span.get("size")):
                     continue
                 srect = pymupdf.Rect(span["bbox"])
                 if srect.is_empty:
@@ -467,6 +469,9 @@ def _scan_math_spans(
                 origin_y = float(span.get("origin", (0.0, srect.y1))[1])
                 spans.append(((lbox[1], lbox[0], srect.x0), srect, origin_y))
     return spans
+
+
+_REPAIR_PAD = 6.0  # pt around a redaction-damaged segment that is repainted
 
 
 def _snapshot(page: pymupdf.Page, rect: pymupdf.Rect) -> pymupdf.Pixmap:
@@ -601,14 +606,22 @@ def render_translated_pdf(
     use_htmlbox = _htmlbox_renders_korean()
     image_mode = _htmlbox_supports_images() if use_htmlbox else ""
     doc = pymupdf.open(src_path)
+    src_doc: pymupdf.Document | None = None  # opened only to repair damage
     try:
         for pno in sorted(by_page):
             page = doc.load_page(pno)
+            # A scanned page's text is part of its picture: the scan pixels
+            # under each translated paragraph are blanked by the redaction,
+            # and the page-sized scan is no expansion obstacle.
+            scanned = is_scanned_page(page)
             # Fixed page furniture acts as expansion obstacles: images,
             # drawings and (below) preserved formula runs.
             base_obstacles: list[pymupdf.Rect] = []
             for info in page.get_image_info():
-                base_obstacles.append(pymupdf.Rect(info["bbox"]))
+                img_rect = pymupdf.Rect(info["bbox"])
+                if scanned and abs(img_rect & page.rect) >= abs(page.rect) * 0.5:
+                    continue
+                base_obstacles.append(img_rect)
             for drawing in page.get_drawings():
                 base_obstacles.append(pymupdf.Rect(drawing["rect"]))
 
@@ -636,6 +649,21 @@ def render_translated_pdf(
                 if any(orect.intersects(rr) for rr in redact_rects):
                     protected.append((orect, _snapshot(page, orect)))
             protected_rects = [rect for rect, _pix in protected]
+
+            # MuPDF's redaction rewrites the page's whole content stream, and
+            # some producers' text (letter-spaced magazine tags such as
+            # Nature's "FEATURE NEWS") loses glyphs in that rewrite even far
+            # from every redact rect. Remember what each untouched segment
+            # reads so damage can be detected and repaired afterwards.
+            watched: list[tuple[pymupdf.Rect, str]] = []
+            for other in all_by_page.get(pno, []):
+                if other.kind not in UNTRANSLATED_KINDS:
+                    continue
+                orect = pymupdf.Rect(*other.bbox)
+                orect.intersect(page.rect)
+                if orect.is_empty or orect in protected_rects:
+                    continue
+                watched.append((orect, page.get_textbox(orect)))
 
             # Math glyph runs on the page: expansion obstacles, inline-flow
             # candidates and (last resort) restore-at-origin clips.
@@ -715,15 +743,33 @@ def render_translated_pdf(
             ]
 
             for rect in redact_rects:
-                page.add_redact_annot(rect, fill=False)
+                page.add_redact_annot(
+                    rect, fill=(1, 1, 1) if scanned else False)
             page.apply_redactions(
-                images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                images=(pymupdf.PDF_REDACT_IMAGE_PIXELS if scanned
+                        else pymupdf.PDF_REDACT_IMAGE_NONE),
                 graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
             )
             for rect, pix in protected:
                 page.insert_image(rect, pixmap=pix)
             for rect, pix in math_clips:
                 page.insert_image(rect, pixmap=pix)
+            damaged = [rect for rect, before in watched
+                       if page.get_textbox(rect) != before]
+            if damaged:
+                if src_doc is None:
+                    src_doc = pymupdf.open(src_path)
+                src_page = src_doc.load_page(pno)
+                for rect in damaged:
+                    # the broken rewrite also shifts the tag's own box/rules
+                    # a little: repair a slightly larger area, but never
+                    # over a translated paragraph
+                    fix = pymupdf.Rect(rect.x0 - _REPAIR_PAD, rect.y0 - _REPAIR_PAD,
+                                       rect.x1 + _REPAIR_PAD, rect.y1 + _REPAIR_PAD)
+                    fix.intersect(page.rect)
+                    if any(fix.intersects(rr) for rr in redact_rects):
+                        fix = rect
+                    page.insert_image(fix, pixmap=_snapshot(src_page, fix))
             for segment in by_page[pno]:
                 rect = pymupdf.Rect(*segment.bbox)
                 if rect.is_empty:
@@ -794,4 +840,6 @@ def render_translated_pdf(
         doc.save(out_path, garbage=3, deflate=True)
     finally:
         doc.close()
+        if src_doc is not None:
+            src_doc.close()
     return report

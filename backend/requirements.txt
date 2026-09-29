@@ -5,3 +5,7 @@ python-multipart
 httpx
 pytest
 anthropic
+onnxruntime
+numpy
+# build-time only: backend/scripts/fetch_models.py quantizes the layout model
+onnx

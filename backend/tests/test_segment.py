@@ -259,3 +259,13 @@ def test_segment_ids_and_geometry(sample_segments):
         x0, y0, x1, y1 = seg.bbox
         assert x0 < x1 and y0 < y1
         assert seg.font_size > 0
+
+
+def test_nature_author_list_and_byline():
+    from app.pipeline.segment import _BYLINE_RE, _looks_like_author_list
+    assert _looks_like_author_list(
+        "Wei Xu1,14, Ana de Souza Braz4*, Li Shi5† & John Roe2")
+    assert _BYLINE_RE.match("BY MONYA BAKER")
+    assert not _looks_like_author_list(
+        "We trained the model, tuned it, and evaluated it on held-out data")
+    assert not _BYLINE_RE.match("By contrast, the second model failed to converge")

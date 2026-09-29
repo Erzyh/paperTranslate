@@ -20,6 +20,10 @@ override paths/settings without re-importing modules.
                                  the rest wait in the queue
 - PAPERTRANSLATE_CLAUDE_EFFORT:  Claude effort level low|medium|high|xhigh|max
                                  (default "medium")
+- PAPERTRANSLATE_MODELS_DIR:     layout/OCR ONNX models (default backend/models,
+                                 filled by scripts/fetch_models.py)
+- PAPERTRANSLATE_LAYOUT_MODEL:   "0" disables the layout model and OCR
+                                 (rule-based segmentation only)
 """
 
 import os
@@ -148,6 +152,17 @@ def get_update_repo() -> str:
 def get_install_dir() -> Path | None:
     raw = os.environ.get("PAPERTRANSLATE_INSTALL_DIR")
     return Path(raw) if raw else None
+
+
+def get_models_dir() -> Path:
+    """Layout/OCR ONNX models (PAPERTRANSLATE_MODELS_DIR overrides)."""
+    raw = os.environ.get("PAPERTRANSLATE_MODELS_DIR")
+    return Path(raw) if raw else BASE_DIR / "models"
+
+
+def layout_model_enabled() -> bool:
+    """False when PAPERTRANSLATE_LAYOUT_MODEL=0 (rules-only segmentation)."""
+    return os.environ.get("PAPERTRANSLATE_LAYOUT_MODEL", "1") != "0"
 
 
 def get_data_dir() -> Path:

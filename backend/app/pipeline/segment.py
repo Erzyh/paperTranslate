@@ -11,10 +11,16 @@ import re
 from collections import defaultdict
 
 from .extract import _is_math_font
-from .models import DocumentLayout, Line, PageLayout, Segment, Span
+from .models import DocumentLayout, Line, PageLayout, Region, Segment, Span
 from .regions import detect_figures, h_overlap, select_captions
 
 HEADER_FOOTER_BAND = 0.05  # top/bottom page-height fraction
+# Left/right page-width fraction treated as the outer margin. A line that
+# starts inside the right strip (or ends inside the left one) is margin
+# furniture: vertical download stamps ("Downloaded from science.org"),
+# whose upright CJK glyphs survive the rotated-line filter in extract.py.
+# No body line starts beyond 92% of the page width.
+SIDE_MARGIN_BAND = 0.08
 COLUMN_GAP_RATIO = 0.15  # x0 gap larger than width*ratio splits columns
 PARA_GAP_FACTOR = 0.8  # y gap below font_size*factor merges lines
 HEADING_SIZE_DELTA = 1.5  # pt above body size that marks a heading
@@ -64,6 +70,52 @@ _AUTHOR_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 _ABSTRACT_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
+# (B') Nature/Science-style front matter carries none of the cues above:
+# the author list is bare names with superscript affiliation numbers, the
+# article metadata sits in a side column, and affiliations are a small-type
+# footnote at the bottom of page 0. These shapes are recognised directly.
+#
+# Superscript affiliation marks glued to a name: "Xu1,14", "Braz4*", "Shi5†".
+_AFFIL_MARK_RE = re.compile(r"(?<=[A-Za-z.])[\d*†‡§¶#✉]+(?:,[\d*†‡§¶#✉]+)*")
+# Lower-case name particles that may sit inside a person's name.
+_NAME_PARTICLES = frozenset({
+    "de", "van", "der", "von", "da", "di", "la", "le", "du", "del", "dos",
+    "bin", "al",
+})
+# Article metadata block (DOI / received / accepted / published dates).
+_ARTICLE_META_RE = re.compile(
+    r"https?://doi\.org/|\bReceived:\s|\bAccepted:\s|\bPublished online:",
+    re.IGNORECASE,
+)
+# Magazine byline: "BY MONYA BAKER", "By Jane Doe and John Roe".
+_BYLINE_RE = re.compile(
+    r"^\s*by\s+[A-Za-z][A-Za-z.'’-]*(?:\s+(?:and\s+)?[A-Za-z][A-Za-z.'’-]*){0,5}\s*$",
+    re.IGNORECASE,
+)
+# An affiliation footnote names several institutions at once.
+_AFFIL_FOOTNOTE_MIN_CUES = 2
+
+
+def _looks_like_author_list(text: str) -> bool:
+    """True for a bare list of person names ("A B1, C D2 & E F3").
+
+    Every comma/"&"/"and"-separated part must look like a name: 2-5 words,
+    each capitalised (initials allowed) or a lower-case particle, no digits
+    once affiliation marks are removed. At least three names are required so
+    a short phrase with two capitalised words never qualifies.
+    """
+    cleaned = _AFFIL_MARK_RE.sub("", text)
+    parts = [p.strip() for p in re.split(r",|&|\band\b", cleaned) if p.strip()]
+    if len(parts) < 3:
+        return False
+    named = 0
+    for part in parts:
+        words = part.split()
+        if not 2 <= len(words) <= 5 or any(ch.isdigit() for ch in part):
+            continue
+        if all(w[0].isupper() or w.lower() in _NAME_PARTICLES for w in words):
+            named += 1
+    return named / len(parts) >= 0.8
 # (F) IEEE Access glues all-caps front-matter labels to the paragraph they
 # announce ("ABSTRACT Document translation ...", "INDEX TERMS Terms ...").
 # Such a label is split off as an independent heading segment so the
@@ -312,10 +364,14 @@ def _join_row(group: list[Line]) -> Line:
     return Line(spans=spans, bbox=_union_bbox([ln.bbox for ln in ordered]))
 
 
-def _merge_visual_rows(lines: list[Line], body_size: float) -> list[Line]:
+def _merge_visual_rows(
+    lines: list[Line], body_size: float, regions: list[Region] = (),
+) -> list[Line]:
     """Re-assemble prose rows split into fragment lines (see block comment).
 
     ``lines`` must be sorted by (y0, x0); the result preserves that order.
+    Lines of different layout-model regions never join one row (a pull
+    quote beside a column line is not the rest of that line).
     """
     if len(lines) < 2:
         return lines
@@ -337,6 +393,9 @@ def _merge_visual_rows(lines: list[Line], body_size: float) -> list[Line]:
             return
         if len(group) == 1:
             merged.append(group[0])
+            return
+        if len({_region_key(line, regions) for line in group} - {-1}) > 1:
+            merged.extend(group)
             return
         row_x0 = min(line.bbox[0] for line in group)
         flow_row = (
@@ -874,6 +933,34 @@ def _is_body_formula_tail(line: Line, prose_x0: float | None) -> bool:
             and visible[-1] in _TAIL_END_CHARS)
 
 
+# Unnumbered run-in subheadings of magazine layouts (Nature features,
+# Science news): "THE SCALE OF REPRODUCIBILITY", "WHAT CAN BE DONE?". They
+# are bold all-caps lines at roughly body size, so neither the numbering
+# prefix nor the size delta catches them and they used to be glued onto the
+# paragraph below.
+_UNNUMBERED_HEAD_MAX_WORDS = 8
+
+
+def _is_unnumbered_heading_line(line: Line, body_size: float) -> bool:
+    """Bold all-caps standalone line that reads like a subheading.
+
+    A bare caps name ("MONYA BAKER") has the same shape, so a heading must
+    either be a question or contain at least one function word ("THE",
+    "OF", "CAN", ...) -- person names never do.
+    """
+    text = _line_text(line).strip()
+    if not text or len(text) > 80 or text[-1] in ".,;:":
+        return False
+    if not (_caps_only(text) and _line_is_bold(line)):
+        return False
+    if _line_size(line) < body_size - 0.5:
+        return False  # figure labels, footnote-sized caps
+    words = _WORD_RE.findall(text)
+    if not 2 <= len(words) <= _UNNUMBERED_HEAD_MAX_WORDS:
+        return False
+    return text.endswith("?") or any(w.lower() in _PROSE_STOPWORDS for w in words)
+
+
 def _is_heading_line(line: Line, body_size: float) -> bool:
     """Numbered-heading line: "VII. CONCLUSION", "A. MOTIVATION", "2.3 Foo".
 
@@ -885,7 +972,7 @@ def _is_heading_line(line: Line, body_size: float) -> bool:
         return False
     match = _HEAD_PREFIX_RE.match(text)
     if match is None:
-        return False
+        return _is_unnumbered_heading_line(line, body_size)
     rest = text[match.end():].strip()
     if not any(ch.isalpha() for ch in rest):
         return False
@@ -1250,6 +1337,7 @@ def _body_font_size(layout: DocumentLayout) -> float:
 def _merge_column_paragraphs(
     lines: list[Line], body_size: float,
     forced_markers: frozenset[int] | set[int] = frozenset(),
+    regions: list[Region] = (),
 ) -> list[tuple[list[Line], str]]:
     """Merge one column's sorted lines into (lines, forced_kind) paragraphs.
 
@@ -1286,6 +1374,20 @@ def _merge_column_paragraphs(
     for zid in sorted(zone_lines):
         zlines = sorted(zone_lines[zid], key=lambda ln: (ln.bbox[1], ln.bbox[0]))
         paragraphs.append((zlines, "formula"))
+    # Layout-model regions: the remaining lines are regrouped per region
+    # (a pull quote mid-column no longer interleaves with the body lines)
+    # and a paragraph never continues into another region. Formula zones
+    # were taken out first, so equation fragments are never split apart.
+    keys = [_region_key(line, regions) for line in plain]
+    if regions:
+        first_seen: dict[int, int] = {}
+        for i, key in enumerate(keys):
+            first_seen.setdefault(key, i)
+        order = sorted(range(len(plain)),
+                       key=lambda i: (first_seen[keys[i]], i))
+        plain = [plain[i] for i in order]
+        fired = [fired[i] for i in order]
+        keys = [keys[i] for i in order]
 
     current: list[Line] = []
     cur_kind = ""  # "", "heading", "formula" or "list"
@@ -1296,7 +1398,11 @@ def _merge_column_paragraphs(
         if current:
             gap = line.bbox[1] - current[-1].bbox[3]
             fits_gap = gap < _line_size(current[-1]) * PARA_GAP_FACTOR
-            if is_marker:
+            if (keys[idx] != keys[idx - 1]
+                    and not _continues_across_regions(
+                        current[-1], line, keys[idx - 1], keys[idx], regions)):
+                absorb = False  # another layout region: new paragraph
+            elif is_marker:
                 absorb = False  # a marker line always starts a new item
             elif cur_kind == "heading":
                 absorb = (fits_gap and cls == "normal"
@@ -1378,6 +1484,16 @@ def _page_flow(
     """
     top = page.height * HEADER_FOOTER_BAND
     bottom = page.height * (1.0 - HEADER_FOOTER_BAND)
+    left = page.width * SIDE_MARGIN_BAND
+    right = page.width * (1.0 - SIDE_MARGIN_BAND)
+    # A line in the side band is margin furniture only when it also lies
+    # wholly outside the text area: a justified body line can end inside the
+    # band ("... learning,'' in") and its last word must not be torn off.
+    inner = [ln.bbox for b in page.blocks if b.type == "text"
+             for ln in b.lines
+             if ln.bbox[0] < right and ln.bbox[2] > left]
+    text_right = max((bb[2] for bb in inner), default=right)
+    text_left = min((bb[0] for bb in inner), default=left)
 
     header_footer_lines: list[Line] = []
     content_blocks: list[list[Line]] = []  # content lines grouped per block
@@ -1390,7 +1506,9 @@ def _page_flow(
                 # Placeholder-only display-equation lines never become
                 # segments: the original glyphs stay in place untouched.
                 continue
-            if line.bbox[3] <= top or line.bbox[1] >= bottom:
+            if (line.bbox[3] <= top or line.bbox[1] >= bottom
+                    or (line.bbox[0] >= right and line.bbox[0] >= text_right)
+                    or (line.bbox[2] <= left and line.bbox[2] <= text_left)):
                 header_footer_lines.append(line)
             else:
                 content.append(line)
@@ -1424,8 +1542,8 @@ def _page_flow(
         for column in sorted(column_lines):
             lines = sorted(column_lines[column],
                            key=lambda ln: (ln.bbox[1], ln.bbox[0]))
-            flow.append(
-                (band_idx, column, _merge_visual_rows(lines, body_size)))
+            flow.append((band_idx, column,
+                         _merge_visual_rows(lines, body_size, page.regions)))
     return flow, header_footer_lines, len(bands)
 
 
@@ -1442,7 +1560,7 @@ def _page_segments(
     paragraphs: list[tuple[int, int, list[Line], str]] = []
     for band_idx, column, lines in flow:
         for para_lines, forced_kind in _merge_column_paragraphs(
-                lines, body_size, forced_markers):
+                lines, body_size, forced_markers, page.regions):
             paragraphs.append((band_idx, column, para_lines, forced_kind))
 
     # Reading order: bands top-to-bottom, columns left-to-right inside a
@@ -1529,11 +1647,39 @@ def _headings_aligned(a: Segment, b: Segment) -> bool:
     return abs(center_a - center_b) <= width * _HEADING_ALIGN_CENTER_RATIO
 
 
-def _merge_adjacent_headings(segments: list[Segment]) -> list[Segment]:
-    """Merge consecutive same-style heading segments (multi-line titles)."""
+def _same_region(a: Segment, b: Segment,
+                 regions_by_page: dict[int, list[Region]]) -> bool:
+    """Both segments sit mostly inside one layout-model region."""
+    regions = regions_by_page.get(a.page) or []
+    ia, sa = _best_region(a.bbox, regions)
+    ib, sb = _best_region(b.bbox, regions)
+    return (ia is not None and ia == ib
+            and sa >= _REGION_MIN_SHARE and sb >= _REGION_MIN_SHARE)
+
+
+def _merge_adjacent_headings(
+    segments: list[Segment],
+    regions_by_page: dict[int, list[Region]] | None = None,
+) -> list[Segment]:
+    """Merge consecutive same-style heading segments (multi-line titles).
+
+    Headings the layout model put in ONE title region (a pull quote whose
+    first word is set larger) merge even when their sizes differ.
+    """
+    regions_by_page = regions_by_page or {}
     merged: list[Segment] = []
     for seg in segments:
         prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and prev.kind == "heading" and seg.kind == "heading"
+            and prev.page == seg.page
+            and _same_region(prev, seg, regions_by_page)
+            and _HEAD_PREFIX_RE.match(seg.text) is None
+        ):
+            prev.text = _join_paragraph([prev.text, seg.text])
+            prev.bbox = _union_bbox([prev.bbox, seg.bbox])
+            continue
         if (
             prev is not None
             and prev.kind == "heading" and seg.kind == "heading"
@@ -1589,6 +1735,21 @@ def _apply_author_kind(
         elif (_AUTHOR_CUE_RE.search(seg.text)
                 and seg.bbox[3] <= page0.height * _AUTHOR_TOP_BAND
                 and (title is None or below_title)):
+            seg.kind = "author"
+        # Nature/Science front matter (see _looks_like_author_list).
+        elif (seg.bbox[3] <= page0.height * _AUTHOR_TOP_BAND
+                and _looks_like_author_list(seg.text)):
+            seg.kind = "author"
+        # A byline ("BY MONYA BAKER") often sits under a half-page cover
+        # headline, below the top band; its shape alone is specific enough.
+        elif _BYLINE_RE.match(seg.text):
+            seg.kind = "author"
+        elif _ARTICLE_META_RE.search(seg.text) and len(seg.text) < 400:
+            seg.kind = "author"
+        # Small-type affiliation footnote, usually at the bottom of page 0.
+        elif (seg.font_size < body_size - 0.5
+                and len(_AUTHOR_CUE_RE.findall(seg.text))
+                >= _AFFIL_FOOTNOTE_MIN_CUES):
             seg.kind = "author"
 
 
@@ -1948,6 +2109,177 @@ def _apply_algorithm_kind(
                         seg.kind = "algorithm"
 
 
+# --- layout-model regions ------------------------------------------------
+# When the layout model ran (layout_model.py), every page carries labelled
+# regions. They are used twice: a paragraph never spans two regions (this
+# separates a standfirst from its headline, chart labels from the body next
+# to them, and paragraphs the gap rule glued together), and after all rule
+# passes the region label decides what the rules could not see. Author
+# detection, list markers and formula zones stay rule-based; the model only
+# overrides a kind where its label is unambiguous.
+_REGION_MIN_SHARE = 0.5  # share of a line/segment area inside its region
+_REGION_UNCOVERED_SHARE = 0.2  # below this share a segment has no region
+_FURNITURE_LABELS = frozenset({
+    "header", "footer", "number", "header_image", "footer_image", "seal",
+    "vertical_text",
+})
+_GRAPHIC_LABELS = frozenset({"image", "chart", "table"})
+_TITLE_LABELS = frozenset({"doc_title", "paragraph_title"})
+_CAPTION_LABELS = frozenset({"figure_title", "vision_footnote"})
+_PROSE_LABELS = frozenset({"text", "abstract", "content", "footnote",
+                           "aside_text"})
+_GRAPHIC_TEXT_MAX_WORDS = 25  # longer text inside a graphic stays prose
+_TITLE_MAX_WORDS = 20  # a "heading" longer than this is prose
+_STRAY_LABEL_MAX_WORDS = 12  # short text outside every region = graphic label
+_RESCUE_MIN_WORDS = 12  # figure_text this long inside a text region = prose
+_RESCUE_MIN_SCORE = 0.8
+
+
+def _area(bbox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _best_region(bbox, regions: list[Region]) -> tuple[int | None, float]:
+    """(index, covered share) of the region overlapping bbox the most."""
+    best, best_inter = None, 0.0
+    for i, region in enumerate(regions):
+        rb = region.bbox
+        ix = min(bbox[2], rb[2]) - max(bbox[0], rb[0])
+        iy = min(bbox[3], rb[3]) - max(bbox[1], rb[1])
+        if ix <= 0 or iy <= 0:
+            continue
+        if ix * iy > best_inter:
+            best, best_inter = i, ix * iy
+    area = _area(bbox)
+    return best, (best_inter / area if area > 0 else 0.0)
+
+
+_REGION_ATTACH_GAP = 1.5  # line heights: stray line joins an adjacent region
+
+
+def _region_key(line: Line, regions: list[Region]) -> int:
+    """Index of the layout region a line belongs to (-1 = none).
+
+    A line the model left outside every region joins the region directly
+    above or below it (the model's box clipped the paragraph's last line).
+    """
+    if not regions:
+        return -1
+    idx, share = _best_region(line.bbox, regions)
+    if share < _REGION_MIN_SHARE:
+        idx = _adjacent_region(line.bbox, regions)
+    return -1 if idx is None else idx
+
+
+def _continues_across_regions(prev: Line, line: Line, prev_key: int,
+                              key: int, regions: list[Region]) -> bool:
+    """A sentence running on into the next text region (a model mis-split).
+
+    The model sometimes cuts one paragraph into two text boxes; when the
+    previous line leaves its sentence open and the next line starts in
+    lower case, and both regions hold prose, the paragraph continues.
+    """
+    for k in (prev_key, key):
+        if k >= 0 and regions[k].label not in _PROSE_LABELS:
+            return False
+    prev_text = _line_text(prev).rstrip()
+    next_text = _line_text(line).lstrip()
+    if not prev_text or not next_text or _ends_paragraph(prev_text):
+        return False
+    first = next((ch for ch in next_text if ch.isalpha()), "")
+    return first.islower()
+
+
+def _adjacent_region(bbox, regions: list[Region]) -> int | None:
+    """Region vertically adjacent to a stray line (same x-range), if any."""
+    reach = max(bbox[3] - bbox[1], 1.0) * _REGION_ATTACH_GAP
+    best, best_gap = None, reach
+    for i, region in enumerate(regions):
+        rb = region.bbox
+        h_over = min(bbox[2], rb[2]) - max(bbox[0], rb[0])
+        if h_over < 0.5 * (bbox[2] - bbox[0]):
+            continue
+        gap = max(rb[1] - bbox[3], bbox[1] - rb[3], 0.0)
+        if gap <= best_gap:
+            best, best_gap = i, gap
+    return best
+
+
+_PROSE_MIN_STOPWORD_RATIO = 0.1
+
+
+def _reads_as_prose(text: str) -> bool:
+    """Long text with a normal share of function words (not a data dump)."""
+    words = _WORD_RE.findall(text)
+    if len(text.split()) <= _GRAPHIC_TEXT_MAX_WORDS or not words:
+        return False
+    return _zone_stopword_count(text) / len(words) >= _PROSE_MIN_STOPWORD_RATIO
+
+
+def _layout_kind(seg: Segment, region: Region | None, share: float) -> str:
+    """The kind a segment gets from its layout region (or its own kind)."""
+    kind = seg.kind
+    words = len(seg.text.split())
+    if region is None or share < _REGION_UNCOVERED_SHARE:
+        # Short text the model did not see as any region: a label drawn in
+        # a graphic (donut-chart percentages, infographic callouts).
+        if kind == "body" and words <= _STRAY_LABEL_MAX_WORDS:
+            return "figure_text"
+        return kind
+    if share < _REGION_MIN_SHARE:
+        return kind
+    label = region.label
+    if label in _FURNITURE_LABELS:
+        return "header_footer" if kind in ("body", "heading", "caption") else kind
+    if label in _GRAPHIC_LABELS:
+        # Chart/table text is always graphic-internal; an "image" box is
+        # sometimes drawn over real text, so there only text that does not
+        # read as prose (short, or few function words: heatmap values,
+        # axis ticks) counts as graphic.
+        if kind in ("body", "heading") and (
+                label != "image" or not _reads_as_prose(seg.text)):
+            return "figure_text"
+        return kind
+    if label == "algorithm":
+        return "algorithm" if kind in ("body", "heading") else kind
+    if label == "reference_content":
+        return "reference" if kind == "body" else kind
+    if label in ("display_formula", "formula_number"):
+        if kind == "body" and ("⟦EQ" in seg.text or words <= 6):
+            return "formula"
+        return kind
+    if label in _TITLE_LABELS:
+        if kind == "body" and words <= _TITLE_MAX_WORDS:
+            return "heading"
+        return kind
+    if label in _CAPTION_LABELS:
+        if kind not in ("body", "heading", "caption"):
+            return kind
+        # A lone panel letter ("b", "d") is a label, not a caption.
+        return "figure_text" if len(seg.text.strip()) <= 2 else "caption"
+    if label in _PROSE_LABELS:
+        if kind == "heading" and words > _TITLE_MAX_WORDS:
+            return "body"
+        if (kind == "figure_text" and words >= _RESCUE_MIN_WORDS
+                and region.score >= _RESCUE_MIN_SCORE):
+            return "body"
+    return kind
+
+
+def _apply_layout_kinds(
+    layout: DocumentLayout, segments: list[Segment]
+) -> None:
+    """Let the layout model's region labels settle segment kinds."""
+    regions_by_page = {page.number: page.regions for page in layout.pages}
+    for seg in segments:
+        regions = regions_by_page.get(seg.page)
+        if not regions or seg.kind in ("author", "header_footer"):
+            continue
+        idx, share = _best_region(seg.bbox, regions)
+        region = regions[idx] if idx is not None else None
+        seg.kind = _layout_kind(seg, region, share)
+
+
 def build_segments(layout: DocumentLayout) -> list[Segment]:
     """Turn a DocumentLayout into translation-ready paragraph segments."""
     body_size = _body_font_size(layout)
@@ -1961,7 +2293,8 @@ def build_segments(layout: DocumentLayout) -> list[Segment]:
         segments.extend(
             _page_segments(page, body_size, flow, hf_lines, band_count,
                            forced_markers))
-    segments = _merge_adjacent_headings(segments)
+    segments = _merge_adjacent_headings(
+        segments, {page.number: page.regions for page in layout.pages})
     _apply_author_kind(layout, segments, body_size)
     _apply_figure_text_kind(layout, segments)
     # Algorithm blocks claim their segments BEFORE the text-table pass:
@@ -1970,4 +2303,5 @@ def build_segments(layout: DocumentLayout) -> list[Segment]:
     _apply_algorithm_kind(layout, segments)
     _apply_text_table_kind(layout, segments, body_size)
     _apply_reference_kind(segments)
+    _apply_layout_kinds(layout, segments)
     return segments

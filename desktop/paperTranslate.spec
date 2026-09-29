@@ -10,7 +10,11 @@ ROOT = Path(SPECPATH).parent  # noqa: F821 - SPECPATH is injected by PyInstaller
 a = Analysis(
     [str(ROOT / "desktop" / "launcher.py")],
     pathex=[str(ROOT / "backend")],
-    datas=[(str(ROOT / "frontend" / "dist"), "frontend_dist")],
+    datas=[
+        (str(ROOT / "frontend" / "dist"), "frontend_dist"),
+        # Layout-detection / OCR models (backend/scripts/fetch_models.py).
+        (str(ROOT / "backend" / "models"), "models"),
+    ],
     # uvicorn picks its loop/protocol implementations by name at runtime, and
     # the pipeline is imported lazily inside the request handlers.
     hiddenimports=collect_submodules("uvicorn") + collect_submodules("app"),

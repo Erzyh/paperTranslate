@@ -100,6 +100,9 @@ def configure_environment() -> None:
     dist = root / "frontend_dist" if frozen() else root / "frontend" / "dist"
     os.environ.setdefault("PAPERTRANSLATE_DATA_DIR", str(data / "data"))
     os.environ.setdefault("PAPERTRANSLATE_FRONTEND_DIST", str(dist))
+    # Layout-detection / OCR models (bundled by desktop/paperTranslate.spec).
+    models = root / "models" if frozen() else root / "backend" / "models"
+    os.environ.setdefault("PAPERTRANSLATE_MODELS_DIR", str(models))
     os.environ.setdefault("PAPERTRANSLATE_TRANSLATOR", "ollama")
     os.environ.setdefault("PAPERTRANSLATE_OLLAMA_MODEL", pick_ollama_model(settings))
     if frozen():
