@@ -276,6 +276,26 @@ export function outputPdfUrl(id: string): string {
   return `${API_BASE}/api/documents/${id}/output.pdf`
 }
 
+/**
+ * POST /api/archives — zip the translated PDFs of finished documents.
+ * ``path`` is where each PDF goes inside the zip (keeps folder structure).
+ * Returns the absolute download URL of the zip.
+ */
+export async function createArchive(
+  items: { id: string; path?: string }[],
+): Promise<{ url: string; count: number }> {
+  const res = await fetch(`${API_BASE}/api/archives`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  const body = await parseJsonOrThrow<{ url: string; count: number }>(
+    res,
+    '전체 다운로드 파일을 만들지 못했습니다',
+  )
+  return { ...body, url: `${API_BASE}${body.url}` }
+}
+
 // ---------------------------------------------------------------- app update
 
 /** Response of GET /api/app/update */

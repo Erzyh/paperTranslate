@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
 import {
   cancelTranslation,
+  createArchive,
   fetchLocalModels,
   getBatchStatus,
   outputPdfUrl,
@@ -266,6 +267,7 @@ function BatchPage({ onOpen }: Props) {
   const [jobs, setJobs] = useState<Job[]>(loadJobs)
   const [dragOver, setDragOver] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [zipping, setZipping] = useState(false)
   // 키·모델은 이 브라우저의 localStorage에 기억한다 (사용자 요청).
   const [apiKeys, setApiKeys] = useState<Record<Provider, string>>(() => ({
     openai: readStored(PROVIDERS.openai.keyStore),
@@ -484,6 +486,32 @@ function BatchPage({ onOpen }: Props) {
     }
   }
 
+  // All finished translations as one zip; papers added from a folder keep
+  // their folder path inside it.
+  const downloadAll = async () => {
+    setZipping(true)
+    setNotice(null)
+    try {
+      const done = jobs.filter((j) => j.status === 'done' && j.docId)
+      const { url } = await createArchive(
+        done.map((j) => ({
+          id: j.docId!,
+          path: j.folder ? `${j.folder}/${j.filename}` : j.filename,
+        })),
+      )
+      const link = document.createElement('a')
+      link.href = url
+      link.download = ''
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : '전체 다운로드에 실패했습니다.')
+    } finally {
+      setZipping(false)
+    }
+  }
+
   const removeJob = (key: string) => {
     filesRef.current.delete(key)
     setJobs((list) => list.filter((j) => j.key !== key))
@@ -665,13 +693,23 @@ function BatchPage({ onOpen }: Props) {
 
           {hasBoard && (
             <>
-              {/* Overall progress: just the gauge, plus the two bulk actions. */}
+              {/* Overall progress: just the gauge, plus the bulk actions. */}
               <div className="batch-summary">
                 <div className="progress-track batch-track" aria-label="전체 진행률">
                   <div className="progress-fill" style={{ width: `${overall}%` }} />
                 </div>
                 {(nActive > 0 || nDone + nProblem > 0) && (
                   <div className="batch-summary-actions">
+                    {nDone > 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-accent"
+                        onClick={() => void downloadAll()}
+                        disabled={zipping}
+                      >
+                        {zipping ? '묶는 중…' : `전체 다운로드 (${nDone})`}
+                      </button>
+                    )}
                     {nActive > 0 && (
                       <button
                         type="button"

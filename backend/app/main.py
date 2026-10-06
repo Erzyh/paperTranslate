@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__, config, db
 from app.api.app_routes import router as app_router
+from app.api.archive import router as archive_router
 from app.api.routes import router
 
 
@@ -37,6 +38,7 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api")
+app.include_router(archive_router, prefix="/api")
 app.include_router(app_router, prefix="/api/app")
 
 # Serve the frontend build (frontend/dist, or PAPERTRANSLATE_FRONTEND_DIST in
