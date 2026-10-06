@@ -120,6 +120,19 @@ function ViewerPage({ doc, onReset }: Props) {
     return byPage
   }, [segments])
 
+  // The translated pane outlines each paragraph where its translation was
+  // actually set, which can be higher up than the source paragraph.
+  const translatedSegmentsByPage = useMemo(() => {
+    const byPage = new Map<number, SegmentInfo[]>()
+    for (const [page, list] of segmentsByPage) {
+      byPage.set(
+        page,
+        list.map((seg) => (seg.translated_bbox ? { ...seg, bbox: seg.translated_bbox } : seg)),
+      )
+    }
+    return byPage
+  }, [segmentsByPage])
+
   // Mentions split per pane: the original pane shows side=original boxes and
   // the translated pane shows side=translated boxes.
   const mentionsBySide = useMemo(() => {
@@ -290,7 +303,7 @@ function ViewerPage({ doc, onReset }: Props) {
         <PdfPane
           url={outputPdfUrl(doc.id)}
           label="번역"
-          segmentsByPage={segmentsByPage}
+          segmentsByPage={translatedSegmentsByPage}
           mentionsByPage={mentionsBySide.translated}
           hoverId={hoverId}
           selectedId={selectedId}

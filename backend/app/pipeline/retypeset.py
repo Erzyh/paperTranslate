@@ -122,6 +122,28 @@ _INK_THRESHOLD = 250
 # the run to count as belonging to it (protection / inline-flow matching).
 _INSIDE_RATIO = 0.7
 
+# --- Uniform type size -------------------------------------------------------
+# Fitting every paragraph on its own gave neighbouring paragraphs visibly
+# different sizes (one at 90 %, the next at 60 %), because Korean text grows
+# by a different amount in each. Paragraphs that share a role and a source
+# font size (all 9 pt body text, all captions, ...) now share one scale: the
+# largest scale at which _UNIFORM_FIT_SHARE of them fit their box. Only the
+# few that do not fit even then shrink further, along the usual ladder.
+# Korean usually runs shorter than the English, so most paragraphs fit at
+# full size and a handful of long ones need less; a low share kept the full
+# size and let those few shrink on their own, which is exactly the uneven
+# look this avoids. Nearly all must fit the shared size.
+_UNIFORM_FIT_SHARE = 0.97
+# Height of one Korean heading line, in em of its font size: measured, the
+# bold Korean line needs 1.15 em; the English heading box is exactly 1 em
+# tall and the next paragraph usually starts 2-3 pt below. See
+# _widen_headings.
+_HEADING_LINE_EM = 1.15
+_HEADING_MIN_GAP = 0.5  # space kept above the next block when growing
+# Stand-in for an inline formula while measuring (formula images are only
+# built later, per page); roughly one formula's width in text.
+_MEASURE_EQ_STANDIN = "\u25a0\u25a0"
+
 _htmlbox_korean_ok: bool | None = None
 _htmlbox_image_mode: str | None = None
 
@@ -268,26 +290,15 @@ def _force_expand_rect(
     return pymupdf.Rect(rect.x0, rect.y0, rect.x1, new_y1)
 
 
-def _insert_html(
-    page: pymupdf.Page,
-    segment: Segment,
-    payload: str,
-    report: RenderReport,
-    obstacles: list[pymupdf.Rect],
-    archive: pymupdf.Archive | None = None,
-) -> bool:
-    """Primary path: insert_htmlbox with automatic down-scaling.
+def _html_style(
+    font_size: float, archive: pymupdf.Archive | None = None,
+) -> tuple[str, pymupdf.Archive | None]:
+    """CSS (and font archive) for one htmlbox insertion at ``font_size``.
 
-    ``payload`` is the ready-made inner HTML (escaped text, optionally with
-    inline <img> formula snippets); ``archive`` resolves relative image
-    sources when the platform requires Archive-based images.
+    Body font injection: register the serif faces via @font-face backed by
+    Archive members. The font archive merges with the inline-formula image
+    archive (member names never collide with the "<segid>_eqN.png" images).
     """
-    rect = pymupdf.Rect(*segment.bbox)
-    if segment.kind == "heading":
-        payload = f"<b>{payload}</b>"
-    # Body font injection: register the serif faces via @font-face backed by
-    # Archive members. The font archive merges with the inline-formula image
-    # archive (member names never collide with the "<segid>_eqN.png" images).
     font = _load_body_font()
     if font is not None:
         if archive is None:
@@ -306,16 +317,42 @@ def _insert_html(
         face_css = ""
     css = (
         f"{face_css}* {{margin:0;padding:0;font-family:{family};"
-        f"font-size:{segment.font_size:.1f}pt;"
+        f"font-size:{font_size:.2f}pt;"
         f"line-height:{_LINE_HEIGHT_EM};}}"
     )
+    return css, archive
+
+
+def _insert_html(
+    page: pymupdf.Page,
+    segment: Segment,
+    payload: str,
+    report: RenderReport,
+    obstacles: list[pymupdf.Rect],
+    archive: pymupdf.Archive | None = None,
+    base_scale: float = 1.0,
+) -> bool:
+    """Primary path: insert_htmlbox with automatic down-scaling.
+
+    ``payload`` is the ready-made inner HTML (escaped text, optionally with
+    inline <img> formula snippets); ``archive`` resolves relative image
+    sources when the platform requires Archive-based images. The text starts
+    at ``base_scale`` of the source size (the shared size of its style, see
+    _uniform_scales); the ladder floors below stay relative to the source
+    size, so only paragraphs that do not fit at the shared size get smaller.
+    """
+    rect = pymupdf.Rect(*segment.bbox)
+    if segment.kind == "heading":
+        payload = f"<b>{payload}</b>"
+    css, archive = _html_style(segment.font_size * base_scale, archive)
 
     def attempt(target: pymupdf.Rect, low: float) -> tuple[float, float]:
         # A failed insert_htmlbox call writes nothing, so retrying with a
-        # different rect/floor never duplicates text.
+        # different rect/floor never duplicates text. ``low`` is relative to
+        # the source size; convert it to the shared starting size.
         return page.insert_htmlbox(
-            target, f"<div>{payload}</div>", css=css, scale_low=low,
-            archive=archive,
+            target, f"<div>{payload}</div>", css=css,
+            scale_low=min(1.0, low / base_scale), archive=archive,
         )
 
     spare, scale = attempt(rect, MIN_SCALE)
@@ -347,9 +384,286 @@ def _insert_html(
             spare, scale = attempt(rect, 0)
     if spare < 0:
         return False  # unreachable in practice; keeps the caller's fallback
-    if scale < 1.0:
-        report.scaled_segments[segment.id] = round(scale, 3)
+    applied = scale * base_scale
+    if applied < 1.0:
+        report.scaled_segments[segment.id] = round(applied, 3)
+    if applied < MIN_SCALE - 1e-3:
+        # Below the normal floor (e.g. a planned flow size for a cramped
+        # region) counts as overflow even when no rescue step was needed.
+        _record_overflow(report, segment.id)
+    report.placed_rects[segment.id] = (rect.x0, rect.y0, rect.x1,
+                                       rect.y1 - max(spare, 0.0))
     return True
+
+
+def _widen_headings(
+    doc: pymupdf.Document,
+    by_page: dict[int, list[Segment]],
+    all_by_page: dict[int, list[Segment]],
+) -> None:
+    """Give translated headings the free room around them (in place).
+
+    A heading's box hugs the English text: exactly one line tall and as wide
+    as the English words. The bold Korean heading then wrapped or missed the
+    line height by a hair and shrank below the body size. When the space is
+    free, the box is widened to its column's right edge and grown to one full
+    Korean line (_HEADING_LINE_EM) downwards.
+    """
+    for pno, segments in by_page.items():
+        page = None
+        furniture: list[pymupdf.Rect] = []
+        for i, segment in enumerate(segments):
+            if segment.kind != "heading":
+                continue
+            if page is None:
+                page = doc.load_page(pno)
+                furniture = [pymupdf.Rect(info["bbox"])
+                             for info in page.get_image_info()]
+                furniture += [pymupdf.Rect(d["rect"]) for d in page.get_drawings()]
+            blockers = furniture + [
+                pymupdf.Rect(*other.bbox)
+                for other in all_by_page.get(pno, []) if other.id != segment.id]
+
+            def free(area: pymupdf.Rect) -> bool:
+                return not any(rect.intersects(area) for rect in blockers)
+
+            x0, y0, x1, y1 = segment.bbox
+            right = max((other.bbox[2] for other in all_by_page.get(pno, [])
+                         if other.column == segment.column
+                         and other.kind in ("body", "caption")),
+                        default=x1)
+            if right > x1 + 1.0 and free(pymupdf.Rect(x1 + 0.5, y0, right, y1)):
+                x1 = right
+            bottom = y0 + segment.font_size * _HEADING_LINE_EM
+            if bottom > y1 and free(
+                    pymupdf.Rect(x0, y1 + 0.1, x1, bottom + _HEADING_MIN_GAP)):
+                y1 = bottom
+            if (x1, y1) == tuple(segment.bbox[2:]):
+                continue
+            grown = replace(segment, bbox=(x0, y0, x1, y1))
+            segments[i] = grown
+            page_all = all_by_page.get(pno, [])
+            for j, other in enumerate(page_all):
+                if other.id == segment.id:
+                    page_all[j] = grown
+
+
+def _style_key(segment: Segment) -> tuple[str, float]:
+    """Paragraphs typeset alike in the source: same role, same font size."""
+    return segment.kind, round(segment.font_size * 2) / 2
+
+
+def _uniform_scales(
+    doc: pymupdf.Document,
+    by_page: dict[int, list[Segment]],
+    translations: dict[str, str],
+) -> dict[str, float]:
+    """Shared starting scale per segment (see "Uniform type size" above).
+
+    Each translation is laid out once on a scratch page of the same size to
+    find the largest scale at which it fits its box; per style the shared
+    scale is the one at which _UNIFORM_FIT_SHARE of the paragraphs fit.
+    """
+    needs: dict[tuple[str, float], list[tuple[str, float]]] = {}
+    scratch = pymupdf.open()
+    try:
+        for pno, segments in by_page.items():
+            src = doc.load_page(pno)
+            page = scratch.new_page(width=src.rect.width, height=src.rect.height)
+            for segment in segments:
+                rect = pymupdf.Rect(*segment.bbox)
+                if rect.is_empty or rect.height < _MIN_RECT_HEIGHT:
+                    continue
+                text = _EQ_TOKEN_RE.sub(_MEASURE_EQ_STANDIN,
+                                        translations[segment.id])
+                payload = html.escape(text).replace("\n", "<br>")
+                if segment.kind == "heading":
+                    payload = f"<b>{payload}</b>"
+                css, archive = _html_style(segment.font_size)
+                spare, scale = page.insert_htmlbox(
+                    rect, f"<div>{payload}</div>", css=css, scale_low=0,
+                    archive=archive)
+                needs.setdefault(_style_key(segment), []).append(
+                    (segment.id, scale if spare >= 0 else 0.0))
+    finally:
+        scratch.close()
+    shared: dict[str, float] = {}
+    for group in needs.values():
+        ordered = sorted((need for _id, need in group), reverse=True)
+        cut = max(1, -(-len(ordered) * _UNIFORM_FIT_SHARE // 1))  # ceil
+        scale = min(1.0, max(MIN_SCALE, ordered[int(cut) - 1]))
+        for seg_id, _need in group:
+            shared[seg_id] = scale
+    return shared
+
+
+# --- Column flow -------------------------------------------------------------
+# Each paragraph used to stay inside its own English box, so with one shared
+# size the (shorter) Korean left gaps under every paragraph, and filling each
+# box instead made sizes uneven again. Paragraphs now flow: within a column,
+# consecutive body/heading paragraphs with nothing between them (no figure,
+# formula, caption, table rule or text of another column) form a region,
+# and their translations are set one after another from the region's top,
+# keeping the source spacing between paragraphs. The spare room collects at
+# the bottom of the region. Body text uses one size for the whole document:
+# the largest size every region fits, ignoring the odd region that needs to
+# go below _FLOW_SHARED_FLOOR (a cramped abstract box, a paragraph boxed in by
+# figures). Those few use the largest size they can, uniformly, so one tight
+# spot does not shrink the whole paper.
+_FLOW_SHARED_FLOOR = 0.9
+_FLOW_ANCHOR_AREA = 2.0  # pt^2 of overlap that pins a paragraph in place
+_FLOW_LEAD_IN_LINES = 2.0  # paragraphs under this many lines can be lead-ins
+_FLOW_LEAD_IN_GAP = 4.0    # pt between a lead-in and what it introduces
+_FLOW_KINDS = ("body", "heading")
+_FLOW_SEARCH_STEPS = 7  # binary-search steps for a region's largest scale
+_FLOW_SCALE_LOW = 0.3   # lowest scale the region search considers
+
+
+def _flow_regions(
+    page: pymupdf.Page,
+    page_segments: list[Segment],
+    flow_ids: set[str],
+) -> list[list[Segment]]:
+    """Runs of translated paragraphs that may flow as one block, per column."""
+    furniture = [pymupdf.Rect(info["bbox"]) for info in page.get_image_info()]
+    furniture += [pymupdf.Rect(d["rect"]) for d in page.get_drawings()]
+    flow = [seg for seg in page_segments if seg.id in flow_ids]
+    fixed = [pymupdf.Rect(*seg.bbox) for seg in page_segments
+             if seg.id not in flow_ids]
+    regions: list[list[Segment]] = []
+    for column in sorted({seg.column for seg in flow}):
+        in_col = sorted((seg for seg in flow if seg.column == column),
+                        key=lambda seg: seg.bbox[1])
+        other_cols = [pymupdf.Rect(*seg.bbox) for seg in flow
+                      if seg.column != column]
+
+        def anchored(seg: Segment) -> bool:
+            # Something kept in place overlaps the paragraph itself (an
+            # inline formula fragment, a figure label): moving the text
+            # would tear it away, so the paragraph stays where it was.
+            # A one-line lead-in ("• NPC baseline term:") right above a
+            # formula or figure introduces it and stays with it too.
+            rect = pymupdf.Rect(*seg.bbox)
+            below = None
+            if rect.height < _FLOW_LEAD_IN_LINES * seg.font_size:
+                below = pymupdf.Rect(rect.x0, rect.y1, rect.x1,
+                                     rect.y1 + _FLOW_LEAD_IN_GAP)
+            return any(((rect & other).get_area() > _FLOW_ANCHOR_AREA
+                        or (below is not None and other.intersects(below)))
+                       and not other.contains(rect)
+                       for other in furniture + fixed)
+
+        current = [in_col[0]]
+        for nxt in in_col[1:]:
+            prev = current[-1]
+            if anchored(prev) or anchored(nxt):
+                regions.append(current)
+                current = [nxt]
+                continue
+            prev_rect = pymupdf.Rect(*prev.bbox)
+            next_rect = pymupdf.Rect(*nxt.bbox)
+            x0 = min(seg.bbox[0] for seg in current + [nxt])
+            x1 = max(seg.bbox[2] for seg in current + [nxt])
+            band = pymupdf.Rect(x0, prev.bbox[3], x1, nxt.bbox[1])
+            blocked = band.height > 0 and any(
+                rect.intersects(band)
+                # a background box around both paragraphs is no separator
+                and not (rect.contains(prev_rect) and rect.contains(next_rect))
+                for rect in furniture + fixed + other_cols)
+            if blocked:
+                regions.append(current)
+                current = [nxt]
+            else:
+                current.append(nxt)
+        regions.append(current)
+    return regions
+
+
+def _flow_payload(segment: Segment, text: str) -> str:
+    text = _EQ_TOKEN_RE.sub(_MEASURE_EQ_STANDIN, text)
+    payload = html.escape(text).replace("\n", "<br>")
+    return f"<b>{payload}</b>" if segment.kind == "heading" else payload
+
+
+def _flow_fits(
+    page: pymupdf.Page,
+    region: list[Segment],
+    translations: dict[str, str],
+    scales: dict[str, float],
+    body_scale: float,
+) -> bool:
+    """Does the region's text fit when set one paragraph after another?"""
+    bottom = max(seg.bbox[3] for seg in region)
+    cursor = region[0].bbox[1]
+    for i, seg in enumerate(region):
+        rect = pymupdf.Rect(seg.bbox[0], cursor, seg.bbox[2], bottom)
+        if rect.height <= 0:
+            return False
+        scale = body_scale if seg.kind == "body" else scales.get(seg.id, 1.0)
+        css, archive = _html_style(seg.font_size * scale)
+        spare, _scale = page.insert_htmlbox(
+            rect, f"<div>{_flow_payload(seg, translations[seg.id])}</div>",
+            css=css, scale_low=1.0, archive=archive)
+        if spare < 0:
+            return False
+        cursor = rect.y1 - spare
+        if i + 1 < len(region):
+            cursor += max(0.0, region[i + 1].bbox[1] - seg.bbox[3])
+    return True
+
+
+def _plan_flow(
+    doc: pymupdf.Document,
+    by_page: dict[int, list[Segment]],
+    all_by_page: dict[int, list[Segment]],
+    translations: dict[str, str],
+    scales: dict[str, float],
+) -> dict[str, tuple[int, float, float]]:
+    """Group paragraphs into flow regions and choose the body size.
+
+    Updates ``scales`` in place with the body scale of every flowed body
+    paragraph and returns seg id -> (region id, gap after it, region bottom).
+    """
+    regions: list[list[Segment]] = []
+    for pno, segments in by_page.items():
+        flow_ids = {seg.id for seg in segments if seg.kind in _FLOW_KINDS}
+        if flow_ids:
+            regions += _flow_regions(doc.load_page(pno),
+                                     all_by_page.get(pno, segments), flow_ids)
+    # Largest body scale each region fits at.
+    best: list[float] = []
+    scratch = pymupdf.open()
+    try:
+        for region in regions:
+            src = doc.load_page(region[0].page)
+            page = scratch.new_page(width=src.rect.width, height=src.rect.height)
+            if _flow_fits(page, region, translations, scales, 1.0):
+                best.append(1.0)
+                continue
+            lo, hi = _FLOW_SCALE_LOW, 1.0
+            for _ in range(_FLOW_SEARCH_STEPS):
+                mid = (lo + hi) / 2
+                if _flow_fits(page, region, translations, scales, mid):
+                    lo = mid
+                else:
+                    hi = mid
+            best.append(lo)
+    finally:
+        scratch.close()
+    with_body = [b for b, region in zip(best, regions)
+                 if any(seg.kind == "body" for seg in region)]
+    shared = min((b for b in with_body if b >= _FLOW_SHARED_FLOOR),
+                 default=_FLOW_SHARED_FLOOR)
+    plan: dict[str, tuple[int, float, float]] = {}
+    for region_id, (region, fit) in enumerate(zip(regions, best)):
+        bottom = max(seg.bbox[3] for seg in region)
+        for i, seg in enumerate(region):
+            gap = (max(0.0, region[i + 1].bbox[1] - seg.bbox[3])
+                   if i + 1 < len(region) else 0.0)
+            plan[seg.id] = (region_id, gap, bottom)
+            if seg.kind == "body":
+                scales[seg.id] = min(shared, fit)
+    return plan
 
 
 def _insert_textbox(
@@ -358,6 +672,7 @@ def _insert_textbox(
     text: str,
     report: RenderReport,
     obstacles: list[pymupdf.Rect],
+    base_scale: float = 1.0,
 ) -> bool:
     """Fallback path: insert_textbox with the body serif font when it is
     available, else the built-in Korean font."""
@@ -380,7 +695,7 @@ def _insert_textbox(
             align=pymupdf.TEXT_ALIGN_LEFT,
         )
 
-    size = segment.font_size
+    size = segment.font_size * base_scale
     min_size = segment.font_size * MIN_SCALE
     pre_expand_size = max(segment.font_size * _PRE_EXPAND_SCALE, 1.0)
     leftover = -1.0
@@ -423,6 +738,8 @@ def _insert_textbox(
         return False  # pathological; the caller records the overflow
     if size < segment.font_size:
         report.scaled_segments[segment.id] = round(size / segment.font_size, 3)
+    report.placed_rects[segment.id] = (rect.x0, rect.y0, rect.x1,
+                                       rect.y1 - max(leftover, 0.0))
     return True
 
 
@@ -608,6 +925,18 @@ def render_translated_pdf(
     doc = pymupdf.open(src_path)
     src_doc: pymupdf.Document | None = None  # opened only to repair damage
     try:
+        _widen_headings(doc, by_page, all_by_page)
+        base_scales = (_uniform_scales(doc, by_page, translations)
+                       if use_htmlbox else {})
+        flow_plan = (_plan_flow(doc, by_page, all_by_page, translations,
+                                base_scales)
+                     if use_htmlbox else {})
+        flow_cursor: dict[int, float] = {}
+        for pno in by_page:
+            # Set flowed paragraphs region by region, top to bottom.
+            by_page[pno].sort(key=lambda seg: (
+                (0, flow_plan[seg.id][0], seg.bbox[1]) if seg.id in flow_plan
+                else (1, 0, seg.bbox[1])))
         for pno in sorted(by_page):
             page = doc.load_page(pno)
             # A scanned page's text is part of its picture: the scan pixels
@@ -719,7 +1048,9 @@ def render_translated_pdf(
                             token = f"⟦EXTRA{pair_no}⟧"
                         ink = _ink_clip(page, rect)
                         png = _snapshot(page, ink).tobytes("png")
-                        cap = segment.font_size * _INLINE_IMG_MAX_EM
+                        cap = (segment.font_size
+                               * base_scales.get(segment.id, 1.0)
+                               * _INLINE_IMG_MAX_EM)
                         factor = (min(1.0, cap / ink.height)
                                   if ink.height > 0 else 1.0)
                         disp_w = ink.width * factor
@@ -774,7 +1105,15 @@ def render_translated_pdf(
                 rect = pymupdf.Rect(*segment.bbox)
                 if rect.is_empty:
                     continue  # never redacted above -> no text was removed
-                if rect.height < _MIN_RECT_HEIGHT:
+                flow = flow_plan.get(segment.id)
+                if flow is not None:
+                    # Column flow: start where the previous paragraph of the
+                    # region ended; the region's bottom is the limit.
+                    region_id, _gap, bottom = flow
+                    top = flow_cursor.setdefault(region_id, rect.y0)
+                    segment = replace(segment, bbox=(rect.x0, top, rect.x1,
+                                                     max(bottom, top + _MIN_RECT_HEIGHT)))
+                elif rect.height < _MIN_RECT_HEIGHT:
                     # This bbox WAS redacted; a too-thin rect must not drop
                     # its text (loss-free policy). Grow it to one line
                     # height, clamped to the page, before inserting.
@@ -819,11 +1158,13 @@ def render_translated_pdf(
                     placed = _insert_html(
                         page, segment, payload, report, obstacles,
                         archive=archive,
+                        base_scale=base_scales.get(segment.id, 1.0),
                     )
                 if not placed:
                     if text.strip():
                         placed = _insert_textbox(
-                            page, segment, text, report, obstacles)
+                            page, segment, text, report, obstacles,
+                            base_scale=base_scales.get(segment.id, 1.0))
                     if runs is not None:
                         # Inline insertion failed: restore the runs at their
                         # original coordinates so no formula content is lost.
@@ -831,6 +1172,10 @@ def render_translated_pdf(
                             page.insert_image(orect, stream=png)
                 if not placed and text.strip():
                     _record_overflow(report, segment.id)
+                flow = flow_plan.get(segment.id)
+                if flow is not None and segment.id in report.placed_rects:
+                    flow_cursor[flow[0]] = (report.placed_rects[segment.id][3]
+                                            + flow[1])
         try:
             # insert_htmlbox embeds the full CJK fallback font per page;
             # subsetting shrinks the output by orders of magnitude.

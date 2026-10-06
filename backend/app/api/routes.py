@@ -403,9 +403,12 @@ async def _run_translation(doc_id: str, src_path: str, out_path: str,
             kwargs["on_phase"] = set_phase
         else:
             set_phase("translating")
-        return run_pipeline(src_path, out_path, translator,
-                            on_progress=on_progress,
-                            segment_cb=segment_cb, **kwargs)
+        report = run_pipeline(src_path, out_path, translator,
+                              on_progress=on_progress,
+                              segment_cb=segment_cb, **kwargs)
+        db.set_translated_bboxes(
+            doc_id, getattr(report, "placed_rects", None) or {})
+        return report
 
     WAITING.append(doc_id)
     PHASE[doc_id] = "queued"
@@ -719,6 +722,7 @@ async def list_segments(doc_id: str, page: int | None = None):
             "seg_id": row["seg_id"],
             "page": row["page"],
             "bbox": row["bbox"],
+            "translated_bbox": row.get("translated_bbox"),
             "kind": row["kind"],
             "source": row["source"],
             "translated": row["translated"],

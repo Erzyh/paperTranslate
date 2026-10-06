@@ -22,6 +22,12 @@
 2단 칼럼, 그림, 표, 수식, 페이지 배치는 그대로 두고 본문 텍스트만 한국어로 바꾼 PDF를 만듭니다.
 원문과 번역을 나란히 놓고 읽을 수 있고, 논문 여러 편이나 폴더 하나를 통째로 넣어 한 번에 번역할 수 있습니다.
 
+실제 논문 한 쪽을 번역한 결과입니다. 왼쪽이 원문, 오른쪽이 번역본입니다. 번역문은 단 안에서 문단이 이어지도록 다시 조판하고, 같은 종류의 글은 문서 전체에서 같은 크기로 맞춥니다.
+
+<img src=".github/before-after.png" alt="원문과 번역본 비교" width="860">
+
+<sub>예시 논문: H. Gil and S. Kang, "A Rapid and Automated Difficulty Evaluation Framework for Rhythm Games via Persona-Driven Multi-Task Behavioral Cloning," IEEE Access, vol. 14, 2026, doi:10.1109/ACCESS.2026.3712365. CC BY 4.0 라이선스로 공개된 논문의 2쪽을 paperTranslate로 번역했습니다.</sub>
+
 ## 주요 기능
 
 - 원문 레이아웃을 유지한 번역 PDF

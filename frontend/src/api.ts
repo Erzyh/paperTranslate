@@ -69,6 +69,9 @@ export interface SegmentInfo {
   seg_id: string
   page: number
   bbox: [number, number, number, number]
+  /** Where the translation landed in the output PDF (paragraphs flow within
+   *  their column); null for older documents and untranslated segments. */
+  translated_bbox?: [number, number, number, number] | null
   kind: SegmentKind
   source: string
   translated: string | null

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS segments (
     source TEXT NOT NULL,
     translated TEXT,
     status TEXT NOT NULL,
+    translated_bbox TEXT,
     PRIMARY KEY (doc_id, seg_id)
 );
 CREATE TABLE IF NOT EXISTS doc_assets (
@@ -57,6 +58,11 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        # Databases created before translated_bbox existed.
+        columns = {row["name"] for row in
+                   conn.execute("PRAGMA table_info(segments)").fetchall()}
+        if "translated_bbox" not in columns:
+            conn.execute("ALTER TABLE segments ADD COLUMN translated_bbox TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -176,6 +182,24 @@ def upsert_segment(doc_id: str, seg_id: str, page: int, bbox: tuple | list,
         conn.close()
 
 
+def set_translated_bboxes(doc_id: str, rects: dict[str, tuple]) -> None:
+    """Store where each translation landed in the output PDF (paragraphs
+    flow within their column, so this can differ from the source bbox)."""
+    if not rects:
+        return
+    conn = get_conn()
+    try:
+        conn.executemany(
+            "UPDATE segments SET translated_bbox = ? "
+            "WHERE doc_id = ? AND seg_id = ?",
+            [(json.dumps([round(v, 2) for v in rect]), doc_id, seg_id)
+             for seg_id, rect in rects.items()],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def list_segments(doc_id: str, page: int | None = None) -> list[dict]:
     conn = get_conn()
     try:
@@ -194,6 +218,8 @@ def list_segments(doc_id: str, page: int | None = None) -> list[dict]:
         for row in rows:
             item = dict(row)
             item["bbox"] = json.loads(item["bbox"])
+            raw = item.get("translated_bbox")
+            item["translated_bbox"] = json.loads(raw) if raw else None
             result.append(item)
         return result
     finally:

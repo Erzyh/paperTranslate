@@ -67,3 +67,7 @@ class Segment:
 class RenderReport:
     overflow_segments: list[str]
     scaled_segments: dict[str, float]  # segment id -> applied scale factor
+    # segment id -> rect the translation actually occupies in the output
+    # (paragraphs flow within their column, so it can differ from the bbox)
+    placed_rects: dict[str, tuple[float, float, float, float]] = field(
+        default_factory=dict)

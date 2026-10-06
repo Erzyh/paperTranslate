@@ -725,3 +725,38 @@ def test_local_models_excludes_ollama_cloud_models(client, monkeypatch):
     _install_preflight_transport(monkeypatch, _tags("qwen3.5:9b", "gemma4:31b-cloud"))
     names = [m["name"] for m in client.get("/api/local-models").json()["models"]]
     assert names == ["qwen3.5:9b"]
+
+
+def test_translated_bbox_stored_and_migrated(data_dir):
+    """Where a translation landed is stored per segment and served by
+    GET /segments; databases from before the column existed are upgraded."""
+    import sqlite3
+
+    from app import config, db
+    from app.main import app
+
+    # An old database: segments table without translated_bbox.
+    config.ensure_dirs()
+    conn = sqlite3.connect(str(config.get_db_path()))
+    conn.execute(
+        "CREATE TABLE segments (doc_id TEXT NOT NULL, seg_id TEXT NOT NULL, "
+        "page INTEGER NOT NULL, bbox TEXT NOT NULL, kind TEXT NOT NULL, "
+        "source TEXT NOT NULL, translated TEXT, status TEXT NOT NULL, "
+        "PRIMARY KEY (doc_id, seg_id))")
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+    db.insert_document("flow-doc", "flow.pdf", 1, status="done")
+    db.upsert_segment("flow-doc", "p0_s0", 0, (10, 100, 200, 150), "body",
+                      "Source.", "번역.")
+    db.upsert_segment("flow-doc", "p0_s1", 0, (10, 160, 200, 170), "body",
+                      "Other.", "기타.")
+    db.set_translated_bboxes("flow-doc", {"p0_s0": (10.0, 90.0, 200.0, 120.5)})
+
+    with TestClient(app) as client:
+        rows = {row["seg_id"]: row
+                for row in client.get("/api/documents/flow-doc/segments").json()}
+    assert rows["p0_s0"]["translated_bbox"] == [10.0, 90.0, 200.0, 120.5]
+    assert rows["p0_s0"]["bbox"] == [10, 100, 200, 150]
+    assert rows["p0_s1"]["translated_bbox"] is None

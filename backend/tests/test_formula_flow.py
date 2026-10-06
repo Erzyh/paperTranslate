@@ -165,11 +165,15 @@ def test_inline_formulas_flow_with_translated_text(
                 for line in hangul_lines
             ), f"inline image {img} not inside any translated text line"
         # At least one run moved away from its original coordinates (the
-        # stub translator reorders the tokens into the dummy sentences).
+        # stub translator reorders the tokens into the dummy sentences). A
+        # run counts as moved when no original run sits at the same spot;
+        # comparing the line alone misjudged a run that flowed onto the line
+        # where the OTHER run originally was.
         assert any(
-            all(abs(img.y0 - r.y0) > 4.0 for r in span_rects)
+            all(abs(img.y0 - r.y0) > 4.0 or abs(img.x0 - r.x0) > 4.0
+                for r in span_rects)
             for img in inline_imgs
-        ), "no inline image left its original line"
+        ), "no inline image left its original position"
 
         text = out_page.get_text()
         assert "⟦EQ" not in text, "literal placeholder leaked into output"

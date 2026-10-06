@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pymupdf
@@ -122,11 +123,16 @@ def test_translated_lines_do_not_collide(sample_pdf, sample_segments, tmp_path):
     from app.pipeline.translate import StubTranslator
 
     out = tmp_path / "collide_out.pdf"
-    run_pipeline(sample_pdf, str(out), StubTranslator())
+    report = run_pipeline(sample_pdf, str(out), StubTranslator())
 
+    # Paragraphs flow within their column, so compare against where each
+    # translation was actually placed rather than the source bbox.
     segs_by_page: dict[int, list] = {}
     for seg in sample_segments:
         if seg.kind not in UNTRANSLATED_KINDS:
+            placed = report.placed_rects.get(seg.id)
+            if placed is not None:
+                seg = replace(seg, bbox=placed)
             segs_by_page.setdefault(seg.page, []).append(seg)
 
     doc = pymupdf.open(str(out))
@@ -425,3 +431,58 @@ def test_real_pdf_stub_render_loses_no_segment(tmp_path):
     finally:
         doc.close()
     assert lost == [], f"segments lost their translation: {lost}"
+
+
+def _flow_source(tmp_path, with_formula: bool) -> tuple[str, list[Segment]]:
+    """Two long English paragraphs in one column, optionally with a small
+    formula fragment sitting inside the second paragraph's box."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_textbox(pymupdf.Rect(72, 100, 300, 300), "Lorem ipsum " * 120,
+                        fontsize=10)
+    page.insert_textbox(pymupdf.Rect(72, 310, 300, 500), "Dolor sit " * 120,
+                        fontsize=10)
+    segments = [
+        Segment(id="p0_s0", page=0, column=0, bbox=(72.0, 100.0, 300.0, 300.0),
+                text="Lorem ipsum " * 120, kind="body", font_size=10.0),
+        Segment(id="p0_s1", page=0, column=0, bbox=(72.0, 310.0, 300.0, 500.0),
+                text="Dolor sit " * 120, kind="body", font_size=10.0),
+    ]
+    if with_formula:
+        page.insert_text((260, 330), "xy", fontsize=10)
+        segments.append(Segment(id="p0_s2", page=0, column=0,
+                                bbox=(258.0, 320.0, 280.0, 334.0), text="xy",
+                                kind="formula", font_size=10.0))
+    src = tmp_path / "flow_src.pdf"
+    doc.save(str(src))
+    doc.close()
+    return str(src), segments
+
+
+def test_short_translation_flows_up_at_one_size(tmp_path):
+    """Column flow: a short translation leaves no gap under its paragraph;
+    the next paragraph follows it, and both share one size."""
+    src, segments = _flow_source(tmp_path, with_formula=False)
+    translations = {"p0_s0": "짧은 번역 문장이다. " * 4,
+                    "p0_s1": "두 번째 문단의 번역이다. " * 4}
+    report = render_translated_pdf(src, segments, translations,
+                                   str(tmp_path / "flow_out.pdf"))
+    first, second = report.placed_rects["p0_s0"], report.placed_rects["p0_s1"]
+    assert first[1] == pytest.approx(100.0)
+    assert first[3] < 160.0, "short translation should not fill the old box"
+    # Follows the first paragraph, keeping the source gap (10pt).
+    assert second[1] == pytest.approx(first[3] + 10.0, abs=0.5)
+    assert (report.scaled_segments.get("p0_s0", 1.0)
+            == report.scaled_segments.get("p0_s1", 1.0))
+    assert not report.overflow_segments
+
+
+def test_paragraph_holding_fixed_fragment_stays_put(tmp_path):
+    """A paragraph overlapping something kept in place (an inline formula
+    fragment) keeps its source position instead of flowing away from it."""
+    src, segments = _flow_source(tmp_path, with_formula=True)
+    translations = {"p0_s0": "짧은 번역 문장이다. " * 4,
+                    "p0_s1": "두 번째 문단의 번역이다. " * 4}
+    report = render_translated_pdf(src, segments, translations,
+                                   str(tmp_path / "flow_out.pdf"))
+    assert report.placed_rects["p0_s1"][1] == pytest.approx(310.0)
