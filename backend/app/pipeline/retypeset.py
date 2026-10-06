@@ -38,6 +38,10 @@ _FLOOR_SCALE = _RESCUE_SCALES[-1]  # scale used with the forced expansion
 # removes the overlap; the capacity loss is absorbed by the loss-free
 # rescue ladder (a slightly smaller scale beats overlapping lines).
 _LINE_HEIGHT_EM = 1.04
+# Flowed body text reads cramped at 1.04 next to the ~1.2 leading of the
+# English. Each flow region takes the most open of these that fits at the
+# shared size; the type size stays uniform and only the leading gives.
+_FLOW_LEADINGS = (1.25, 1.15, _LINE_HEIGHT_EM)
 _FORCED_EXPAND_LINES = 1.0  # forced downward growth cap, in line heights
 _NEIGHBOR_GAP = 3.0  # safety gap kept above the next block when expanding
 # Minimum usable rect height: a redacted bbox thinner than this is grown to
@@ -290,8 +294,19 @@ def _force_expand_rect(
     return pymupdf.Rect(rect.x0, rect.y0, rect.x1, new_y1)
 
 
+def _html_text(text: str) -> str:
+    """Escaped HTML for translated text, newlines as <br>.
+
+    Lines may break between any two Hangul letters, as in most Korean
+    typesetting: keeping words whole (word joiners, since MuPDF ignores
+    word-break:keep-all) left wide gaps in justified lines.
+    """
+    return html.escape(text).replace("\n", "<br>")
+
+
 def _html_style(
     font_size: float, archive: pymupdf.Archive | None = None,
+    line_height: float = _LINE_HEIGHT_EM,
 ) -> tuple[str, pymupdf.Archive | None]:
     """CSS (and font archive) for one htmlbox insertion at ``font_size``.
 
@@ -318,7 +333,7 @@ def _html_style(
     css = (
         f"{face_css}* {{margin:0;padding:0;font-family:{family};"
         f"font-size:{font_size:.2f}pt;"
-        f"line-height:{_LINE_HEIGHT_EM};}}"
+        f"line-height:{line_height};text-align:justify;}}"
     )
     return css, archive
 
@@ -331,6 +346,7 @@ def _insert_html(
     obstacles: list[pymupdf.Rect],
     archive: pymupdf.Archive | None = None,
     base_scale: float = 1.0,
+    line_height: float = _LINE_HEIGHT_EM,
 ) -> bool:
     """Primary path: insert_htmlbox with automatic down-scaling.
 
@@ -344,7 +360,8 @@ def _insert_html(
     rect = pymupdf.Rect(*segment.bbox)
     if segment.kind == "heading":
         payload = f"<b>{payload}</b>"
-    css, archive = _html_style(segment.font_size * base_scale, archive)
+    css, archive = _html_style(segment.font_size * base_scale, archive,
+                               line_height)
 
     def attempt(target: pymupdf.Rect, low: float) -> tuple[float, float]:
         # A failed insert_htmlbox call writes nothing, so retrying with a
@@ -476,7 +493,7 @@ def _uniform_scales(
                     continue
                 text = _EQ_TOKEN_RE.sub(_MEASURE_EQ_STANDIN,
                                         translations[segment.id])
-                payload = html.escape(text).replace("\n", "<br>")
+                payload = _html_text(text)
                 if segment.kind == "heading":
                     payload = f"<b>{payload}</b>"
                 css, archive = _html_style(segment.font_size)
@@ -581,7 +598,7 @@ def _flow_regions(
 
 def _flow_payload(segment: Segment, text: str) -> str:
     text = _EQ_TOKEN_RE.sub(_MEASURE_EQ_STANDIN, text)
-    payload = html.escape(text).replace("\n", "<br>")
+    payload = _html_text(text)
     return f"<b>{payload}</b>" if segment.kind == "heading" else payload
 
 
@@ -591,16 +608,23 @@ def _flow_fits(
     translations: dict[str, str],
     scales: dict[str, float],
     body_scale: float,
+    leading: float = _LINE_HEIGHT_EM,
 ) -> bool:
-    """Does the region's text fit when set one paragraph after another?"""
+    """Does the region's text fit when set one paragraph after another?
+
+    ``leading`` applies to body paragraphs; headings keep the tight one.
+    """
     bottom = max(seg.bbox[3] for seg in region)
     cursor = region[0].bbox[1]
     for i, seg in enumerate(region):
         rect = pymupdf.Rect(seg.bbox[0], cursor, seg.bbox[2], bottom)
         if rect.height <= 0:
             return False
-        scale = body_scale if seg.kind == "body" else scales.get(seg.id, 1.0)
-        css, archive = _html_style(seg.font_size * scale)
+        if seg.kind == "body":
+            css, archive = _html_style(seg.font_size * body_scale,
+                                       line_height=leading)
+        else:
+            css, archive = _html_style(seg.font_size * scales.get(seg.id, 1.0))
         spare, _scale = page.insert_htmlbox(
             rect, f"<div>{_flow_payload(seg, translations[seg.id])}</div>",
             css=css, scale_low=1.0, archive=archive)
@@ -618,11 +642,13 @@ def _plan_flow(
     all_by_page: dict[int, list[Segment]],
     translations: dict[str, str],
     scales: dict[str, float],
+    leadings: dict[str, float],
 ) -> dict[str, tuple[int, float, float]]:
     """Group paragraphs into flow regions and choose the body size.
 
-    Updates ``scales`` in place with the body scale of every flowed body
-    paragraph and returns seg id -> (region id, gap after it, region bottom).
+    Updates ``scales`` and ``leadings`` in place with the body scale and
+    line height of every flowed body paragraph and returns
+    seg id -> (region id, gap after it, region bottom).
     """
     regions: list[list[Segment]] = []
     for pno, segments in by_page.items():
@@ -648,14 +674,25 @@ def _plan_flow(
                 else:
                     hi = mid
             best.append(lo)
+        with_body = [b for b, region in zip(best, regions)
+                     if any(seg.kind == "body" for seg in region)]
+        shared = min((b for b in with_body if b >= _FLOW_SHARED_FLOOR),
+                     default=_FLOW_SHARED_FLOOR)
+        # Then the most open leading each region fits at its final size.
+        region_leading: list[float] = []
+        for region, fit in zip(regions, best):
+            src = doc.load_page(region[0].page)
+            page = scratch.new_page(width=src.rect.width, height=src.rect.height)
+            region_leading.append(next(
+                (lead for lead in _FLOW_LEADINGS[:-1]
+                 if _flow_fits(page, region, translations, scales,
+                               min(shared, fit), lead)),
+                _FLOW_LEADINGS[-1]))
     finally:
         scratch.close()
-    with_body = [b for b, region in zip(best, regions)
-                 if any(seg.kind == "body" for seg in region)]
-    shared = min((b for b in with_body if b >= _FLOW_SHARED_FLOOR),
-                 default=_FLOW_SHARED_FLOOR)
     plan: dict[str, tuple[int, float, float]] = {}
-    for region_id, (region, fit) in enumerate(zip(regions, best)):
+    for region_id, (region, fit, lead) in enumerate(
+            zip(regions, best, region_leading)):
         bottom = max(seg.bbox[3] for seg in region)
         for i, seg in enumerate(region):
             gap = (max(0.0, region[i + 1].bbox[1] - seg.bbox[3])
@@ -663,6 +700,7 @@ def _plan_flow(
             plan[seg.id] = (region_id, gap, bottom)
             if seg.kind == "body":
                 scales[seg.id] = min(shared, fit)
+                leadings[seg.id] = lead
     return plan
 
 
@@ -870,7 +908,7 @@ def _inline_math_payload(
     pos = 0
     used: set[str] = set()
     for match in _EQ_TOKEN_RE.finditer(text):
-        parts.append(html.escape(text[pos:match.start()]))
+        parts.append(_html_text(text[pos:match.start()]))
         token = match.group(0)
         if token in runs and token not in used:
             used.add(token)
@@ -878,7 +916,7 @@ def _inline_math_payload(
         else:
             parts.append(" ")
         pos = match.end()
-    parts.append(html.escape(text[pos:]))
+    parts.append(_html_text(text[pos:]))
     # Leftover runs (dict order = source/reading order) trail the text.
     for token in runs:
         if token not in used:
@@ -928,8 +966,9 @@ def render_translated_pdf(
         _widen_headings(doc, by_page, all_by_page)
         base_scales = (_uniform_scales(doc, by_page, translations)
                        if use_htmlbox else {})
+        leadings: dict[str, float] = {}
         flow_plan = (_plan_flow(doc, by_page, all_by_page, translations,
-                                base_scales)
+                                base_scales, leadings)
                      if use_htmlbox else {})
         flow_cursor: dict[int, float] = {}
         for pno in by_page:
@@ -1154,11 +1193,12 @@ def render_translated_pdf(
                             raw_text, runs, image_mode, names,
                         )
                     else:
-                        payload = html.escape(text).replace("\n", "<br>")
+                        payload = _html_text(text)
                     placed = _insert_html(
                         page, segment, payload, report, obstacles,
                         archive=archive,
                         base_scale=base_scales.get(segment.id, 1.0),
+                        line_height=leadings.get(segment.id, _LINE_HEIGHT_EM),
                     )
                 if not placed:
                     if text.strip():
